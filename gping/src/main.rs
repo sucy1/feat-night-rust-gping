@@ -884,9 +884,6 @@ fn validate_hostname(hostname: &str) -> Result<(), String> {
     if trimmed.is_empty() {
         return Err("Hostname cannot be empty".to_string());
     }
-    if trimmed.len() > 253 {
-        return Err("Hostname too long (max 253 characters)".to_string());
-    }
     if trimmed.contains(char::is_whitespace) {
         return Err("Hostname cannot contain whitespace".to_string());
     }
@@ -895,18 +892,38 @@ fn validate_hostname(hostname: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    if trimmed.starts_with('-') || trimmed.ends_with('-') {
+    let ascii_hostname = if trimmed.is_ascii() {
+        trimmed.to_string()
+    } else {
+        match idna::domain_to_ascii(trimmed) {
+            Ok(encoded) => encoded,
+            Err(_) => return Err("Invalid internationalized domain name".to_string()),
+        }
+    };
+
+    if ascii_hostname.len() > 253 {
+        return Err("Hostname too long (max 253 bytes)".to_string());
+    }
+
+    if ascii_hostname.starts_with('-') || ascii_hostname.ends_with('-') {
         return Err("Hostname cannot start or end with a hyphen".to_string());
     }
-    if trimmed.contains("..") {
+    if ascii_hostname.starts_with('.') || ascii_hostname.ends_with('.') {
+        return Err("Hostname cannot start or end with a dot".to_string());
+    }
+    if ascii_hostname.contains("..") {
         return Err("Hostname contains invalid '..' sequence".to_string());
     }
-    for label in trimmed.split('.') {
+
+    for label in ascii_hostname.split('.') {
         if label.is_empty() {
             return Err("Hostname contains empty label".to_string());
         }
         if label.len() > 63 {
-            return Err("Hostname label too long (max 63 characters)".to_string());
+            return Err("Hostname label too long (max 63 bytes)".to_string());
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err("Hostname label cannot start or end with a hyphen".to_string());
         }
         if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
             return Err("Hostname can only contain ASCII letters, digits, and hyphens".to_string());
@@ -1284,6 +1301,7 @@ mod tests {
         assert!(validate_hostname("::1").is_ok());
         assert!(validate_hostname("a".repeat(63).as_str()).is_ok());
         assert!(validate_hostname("a-b-c.com").is_ok());
+        assert!(validate_hostname("xn--fiqs8s.xn--fiqz9s").is_ok());
 
         assert!(validate_hostname("").is_err());
         assert!(validate_hostname("   ").is_err());
@@ -1295,6 +1313,20 @@ mod tests {
         assert!(validate_hostname(".bad.com").is_err());
         assert!(validate_hostname("a".repeat(64).as_str()).is_err());
         assert!(validate_hostname("host!name.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_hostname_idn() {
+        assert!(validate_hostname("中文.中国").is_ok());
+        assert!(validate_hostname("例え.テスト").is_ok());
+        assert!(validate_hostname("münchen.de").is_ok());
+        assert!(validate_hostname("测试.example.com").is_ok());
+        assert!(validate_hostname("example.公司").is_ok());
+        assert!(validate_hostname("العربية.museum").is_ok());
+        assert!(validate_hostname("中国互联网信息中心.中国").is_ok());
+
+        assert!(validate_hostname("  中文.中国  ").is_err());
+        assert!(validate_hostname("中 文.中国").is_err());
     }
 
     #[test]
