@@ -21,12 +21,13 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::{mpsc, Arc};
+use std::collections::HashMap;
 use std::thread;
 use std::thread::{sleep, JoinHandle};
 use std::time::{Duration, Instant};
 use tui::backend::{Backend, CrosstermBackend};
 use tui::layout::{Constraint, Direction, Flex, Layout};
-use tui::style::{Color, Style};
+use tui::style::{Color, Modifier, Style};
 use tui::text::Span;
 use tui::widgets::{Axis, Block, Borders, Chart, Dataset};
 use tui::Terminal;
@@ -113,20 +114,97 @@ struct App {
     data: Vec<PlotData>,
     display_interval: chrono::Duration,
     started: chrono::DateTime<Local>,
+    selected_target: usize,
+    input_mode: bool,
+    input_buffer: String,
+    colors: Vec<Color>,
+    id_to_idx: HashMap<usize, usize>,
+    next_host_id: usize,
 }
 
 impl App {
-    fn new(data: Vec<PlotData>, buffer: u64) -> Self {
+    fn new(data: Vec<PlotData>, buffer: u64, initial_colors: Vec<Color>) -> Self {
+        let mut id_to_idx = HashMap::new();
+        for (i, _) in data.iter().enumerate() {
+            id_to_idx.insert(i, i);
+        }
+        let next_host_id = data.len();
         App {
             data,
             display_interval: chrono::Duration::from_std(Duration::from_secs(buffer)).unwrap(),
             started: Local::now(),
+            selected_target: 0,
+            input_mode: false,
+            input_buffer: String::new(),
+            colors: initial_colors,
+            id_to_idx,
+            next_host_id,
         }
     }
 
-    fn update(&mut self, host_idx: usize, item: Option<Duration>) {
-        let host = &mut self.data[host_idx];
-        host.update(item);
+    fn allocate_host_id(&mut self) -> usize {
+        let id = self.next_host_id;
+        self.next_host_id += 1;
+        self.id_to_idx.insert(id, self.data.len());
+        id
+    }
+
+    fn update(&mut self, host_id: usize, item: Option<Duration>) {
+        if let Some(&idx) = self.id_to_idx.get(&host_id) {
+            if idx < self.data.len() {
+                let host = &mut self.data[idx];
+                host.update(item);
+            }
+        }
+    }
+
+    fn select_next(&mut self) {
+        if !self.data.is_empty() {
+            self.selected_target = (self.selected_target + 1) % self.data.len();
+        }
+    }
+
+    fn select_prev(&mut self) {
+        if !self.data.is_empty() {
+            self.selected_target = if self.selected_target == 0 {
+                self.data.len() - 1
+            } else {
+                self.selected_target - 1
+            };
+        }
+    }
+
+    fn add_target(&mut self, display: String, buffer: u64, style: Style, simple_graphics: bool) -> usize {
+        let host_id = self.allocate_host_id();
+        self.data.push(PlotData::new(display, buffer, style, simple_graphics));
+        host_id
+    }
+
+    fn remove_target(&mut self, idx: usize) {
+        if idx < self.data.len() && self.data.len() > 1 {
+            self.data.remove(idx);
+            if self.selected_target >= self.data.len() {
+                self.selected_target = self.data.len() - 1;
+            }
+            let mut to_remove = Vec::new();
+            for (&id, &cur_idx) in &self.id_to_idx {
+                if cur_idx == idx {
+                    to_remove.push(id);
+                } else if cur_idx > idx {
+                    self.id_to_idx.insert(id, cur_idx - 1);
+                }
+            }
+            for id in to_remove {
+                self.id_to_idx.remove(&id);
+            }
+        }
+    }
+
+    fn next_color(&mut self) -> Color {
+        let idx = self.colors.len();
+        let new_color = Color::Indexed((idx as u8 % 6) + 2);
+        self.colors.push(new_color);
+        new_color
     }
 
     fn y_axis_bounds(&self) -> [f64; 2] {
@@ -220,11 +298,71 @@ impl From<PingResult> for Update {
     }
 }
 
+struct TargetThread {
+    kill: Arc<AtomicBool>,
+    handle: Option<JoinHandle<Result<()>>>,
+    host_or_cmd: String,
+}
+
+impl TargetThread {
+    fn stop(&mut self) -> Result<()> {
+        self.kill.store(true, Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            handle.join().unwrap()?;
+        }
+        Ok(())
+    }
+}
+
+struct TargetManager {
+    targets: Vec<TargetThread>,
+}
+
+impl TargetManager {
+    fn new() -> Self {
+        TargetManager { targets: Vec::new() }
+    }
+
+    fn add(&mut self, target: TargetThread) {
+        self.targets.push(target);
+    }
+
+    fn remove(&mut self, idx: usize) -> Result<()> {
+        if idx < self.targets.len() {
+            let mut target = self.targets.remove(idx);
+            target.stop()?;
+            self.renumber_host_ids();
+        }
+        Ok(())
+    }
+
+    fn renumber_host_ids(&mut self) {
+        // Note: Host IDs are baked into the threads at creation time.
+        // We handle ID mismatch in the event loop by checking bounds.
+        // The selected_target in App tracks the logical index.
+    }
+
+    fn stop_all(&mut self) -> Result<()> {
+        for target in &mut self.targets {
+            target.kill.store(true, Ordering::Release);
+        }
+        for target in &mut self.targets {
+            if let Some(handle) = target.handle.take() {
+                handle.join().unwrap()?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 enum Event {
     Update(usize, Update),
     Terminate,
     Render,
+    Key(crossterm::event::KeyEvent),
+    AddTarget(String),
+    RemoveTarget(usize),
 }
 
 fn start_render_thread(
@@ -357,8 +495,9 @@ fn main() -> Result<()> {
     }
 
     let mut data = vec![];
+    let mut initial_colors = vec![];
 
-    let colors = Colors::from(args.color_codes_or_names.iter());
+    let colors_iter = Colors::from(args.color_codes_or_names.iter());
     let hosts_or_commands: Vec<String> = args
         .hosts_or_commands
         .clone()
@@ -369,8 +508,9 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    for (host_or_cmd, color) in hosts_or_commands.iter().zip(colors) {
+    for (host_or_cmd, color) in hosts_or_commands.iter().zip(colors_iter) {
         let color = color?;
+        initial_colors.push(color);
         let display = match args.cmd {
             true => host_or_cmd.to_string(),
             false => format!(
@@ -399,49 +539,59 @@ fn main() -> Result<()> {
 
     let (key_tx, rx) = mpsc::channel();
 
-    let mut threads = vec![];
-
-    let killed = Arc::new(AtomicBool::new(false));
+    let mut target_manager = TargetManager::new();
+    let global_kill = Arc::new(AtomicBool::new(false));
 
     for (host_id, host_or_cmd) in hosts_or_commands.iter().cloned().enumerate() {
+        let target_kill = Arc::new(AtomicBool::new(false));
         if args.cmd {
-            let cmd_thread = start_cmd_thread(
+            let handle = start_cmd_thread(
                 &host_or_cmd,
                 host_id,
                 args.watch_interval,
                 key_tx.clone(),
-                std::sync::Arc::clone(&killed),
+                std::sync::Arc::clone(&target_kill),
             );
-            threads.push(cmd_thread);
+            target_manager.add(TargetThread {
+                kill: target_kill,
+                handle: Some(handle),
+                host_or_cmd,
+            });
         } else {
             let interval =
                 Duration::from_millis((args.watch_interval.unwrap_or(0.2) * 1000.0) as u64);
 
             let mut ping_opts = if args.ipv4 {
-                PingOptions::new_ipv4(host_or_cmd, interval, interface.clone())
+                PingOptions::new_ipv4(host_or_cmd.clone(), interval, interface.clone())
             } else if args.ipv6 {
-                PingOptions::new_ipv6(host_or_cmd, interval, interface.clone())
+                PingOptions::new_ipv6(host_or_cmd.clone(), interval, interface.clone())
             } else {
-                PingOptions::new(host_or_cmd, interval, interface.clone())
+                PingOptions::new(host_or_cmd.clone(), interval, interface.clone())
             };
             if let Some(ping_args) = &ping_args {
                 ping_opts = ping_opts.with_raw_arguments(ping_args.clone());
             }
 
-            threads.push(start_ping_thread(
+            let handle = start_ping_thread(
                 ping_opts,
                 host_id,
                 key_tx.clone(),
-                std::sync::Arc::clone(&killed),
-            )?);
+                std::sync::Arc::clone(&target_kill),
+            )?;
+            target_manager.add(TargetThread {
+                kill: target_kill,
+                handle: Some(handle),
+                host_or_cmd,
+            });
         }
     }
-    threads.push(start_render_thread(
-        std::sync::Arc::clone(&killed),
-        key_tx.clone(),
-    ));
 
-    let mut app = App::new(data, args.buffer);
+    let mut app = App::new(data, args.buffer, initial_colors);
+    let _render_handle = start_render_thread(
+        std::sync::Arc::clone(&global_kill),
+        key_tx.clone(),
+    );
+
     enable_raw_mode()?;
     let stdout = io::stdout();
     let mut backend = CrosstermBackend::new(BufWriter::with_capacity(1024 * 1024 * 4, stdout));
@@ -460,23 +610,13 @@ fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    // Pump keyboard messages into the queue
-    let killed_thread = std::sync::Arc::clone(&killed);
+    let key_tx_clone = key_tx.clone();
+    let killed_thread = std::sync::Arc::clone(&global_kill);
     thread::spawn(move || -> Result<()> {
         while !killed_thread.load(Ordering::Acquire) {
             if event::poll(Duration::from_secs(5))? {
                 if let CEvent::Key(key) = event::read()? {
-                    match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => {
-                            key_tx.send(Event::Terminate)?;
-                            break;
-                        }
-                        KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
-                            key_tx.send(Event::Terminate)?;
-                            break;
-                        }
-                        _ => {}
-                    }
+                    key_tx_clone.send(Event::Key(key))?;
                 }
             }
         }
@@ -499,8 +639,83 @@ fn main() -> Result<()> {
                     }
                 };
             }
+            Event::Key(key) => {
+                handle_key_event(
+                    key,
+                    &mut app,
+                    &key_tx,
+                );
+            }
+            Event::AddTarget(target_str) => {
+                let color = app.next_color();
+                let target_str_resolved = match region_map::try_host_from_cloud_region(&target_str) {
+                    None => target_str.clone(),
+                    Some(new_domain) => new_domain,
+                };
+                let display = match args.cmd {
+                    true => target_str_resolved.clone(),
+                    false => match get_host_ipaddr(&target_str_resolved, args.ipv4, args.ipv6) {
+                        Ok(ip) => format!("{} ({})", target_str_resolved, ip),
+                        Err(_) => target_str_resolved.clone(),
+                    },
+                };
+                let new_host_id = app.add_target(
+                    display,
+                    args.buffer,
+                    Style::default().fg(color),
+                    args.simple_graphics,
+                );
+
+                let target_kill = Arc::new(AtomicBool::new(false));
+                if args.cmd {
+                    let handle = start_cmd_thread(
+                        &target_str_resolved,
+                        new_host_id,
+                        args.watch_interval,
+                        key_tx.clone(),
+                        std::sync::Arc::clone(&target_kill),
+                    );
+                    target_manager.add(TargetThread {
+                        kill: target_kill,
+                        handle: Some(handle),
+                        host_or_cmd: target_str_resolved,
+                    });
+                } else {
+                    let interval =
+                        Duration::from_millis((args.watch_interval.unwrap_or(0.2) * 1000.0) as u64);
+                    let mut ping_opts = if args.ipv4 {
+                        PingOptions::new_ipv4(target_str_resolved.clone(), interval, interface.clone())
+                    } else if args.ipv6 {
+                        PingOptions::new_ipv6(target_str_resolved.clone(), interval, interface.clone())
+                    } else {
+                        PingOptions::new(target_str_resolved.clone(), interval, interface.clone())
+                    };
+                    if let Some(ping_args) = &ping_args {
+                        ping_opts = ping_opts.with_raw_arguments(ping_args.clone());
+                    }
+                    if let Ok(handle) = start_ping_thread(
+                        ping_opts,
+                        new_host_id,
+                        key_tx.clone(),
+                        std::sync::Arc::clone(&target_kill),
+                    ) {
+                        target_manager.add(TargetThread {
+                            kill: target_kill,
+                            handle: Some(handle),
+                            host_or_cmd: target_str_resolved,
+                        });
+                    }
+                }
+            }
+            Event::RemoveTarget(idx) => {
+                if app.data.len() > 1 {
+                    target_manager.remove(idx)?;
+                    app.remove_target(idx);
+                }
+            }
             Event::Render => {
                 terminal.draw(|f| {
+                    let bottom_height = if app.input_mode { 3 } else { 2 };
                     let chunks = Layout::default()
                         .flex(Flex::Legacy)
                         .direction(Direction::Vertical)
@@ -508,15 +723,16 @@ fn main() -> Result<()> {
                         .horizontal_margin(args.horizontal_margin)
                         .constraints(
                             std::iter::repeat_n(Constraint::Length(1), app.data.len())
-                                .chain(iter::once(Constraint::Percentage(10)))
+                                .chain(iter::once(Constraint::Min(10)))
+                                .chain(iter::once(Constraint::Length(bottom_height)))
                                 .collect::<Vec<_>>(),
                         )
                         .split(f.area());
 
                     let total_chunks = chunks.len();
-
-                    let header_chunks = &chunks[0..total_chunks - 1];
-                    let chart_chunk = &chunks[total_chunks - 1];
+                    let header_chunks = &chunks[0..total_chunks - 2];
+                    let chart_chunk = &chunks[total_chunks - 2];
+                    let bottom_chunk = &chunks[total_chunks - 1];
 
                     for (plot_data, chunk) in app.data.iter().zip(header_chunks) {
                         let header_layout = Layout::default()
@@ -562,16 +778,18 @@ fn main() -> Result<()> {
                                 .labels(app.y_axis_labels(y_axis_bounds)),
                         );
 
-                    f.render_widget(chart, *chart_chunk)
+                    f.render_widget(chart, *chart_chunk);
+                    render_bottom_bar(f, *bottom_chunk, &app);
                 })?;
             }
             Event::Terminate => {
-                killed.store(true, Ordering::Release);
+                global_kill.store(true, Ordering::Release);
                 break;
             }
         }
     }
-    killed.store(true, Ordering::Relaxed);
+    global_kill.store(true, Ordering::Relaxed);
+    target_manager.stop_all()?;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut())?;
@@ -582,13 +800,302 @@ fn main() -> Result<()> {
         x: new_size.width,
         y: new_size.height,
     })?;
-    for thread in threads {
-        thread.join().unwrap()?;
-    }
 
     if args.clear {
         execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     };
 
     Ok(())
+}
+
+fn handle_key_event(
+    key: crossterm::event::KeyEvent,
+    app: &mut App,
+    key_tx: &Sender<Event>,
+) {
+    if app.input_mode {
+        match key.code {
+            KeyCode::Enter => {
+                let input = app.input_buffer.trim().to_string();
+                if !input.is_empty() {
+                    let _ = key_tx.send(Event::AddTarget(input));
+                }
+                app.input_mode = false;
+                app.input_buffer.clear();
+            }
+            KeyCode::Esc => {
+                app.input_mode = false;
+                app.input_buffer.clear();
+            }
+            KeyCode::Backspace => {
+                app.input_buffer.pop();
+            }
+            KeyCode::Char(c) => {
+                app.input_buffer.push(c);
+            }
+            _ => {}
+        }
+    } else {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => {
+                let _ = key_tx.send(Event::Terminate);
+            }
+            KeyCode::Char('c') if key.modifiers == KeyModifiers::CONTROL => {
+                let _ = key_tx.send(Event::Terminate);
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                app.input_mode = true;
+                app.input_buffer.clear();
+            }
+            KeyCode::Char('-') => {
+                if app.data.len() > 1 {
+                    let _ = key_tx.send(Event::RemoveTarget(app.selected_target));
+                }
+            }
+            KeyCode::Tab | KeyCode::Right | KeyCode::Down => {
+                app.select_next();
+            }
+            KeyCode::BackTab | KeyCode::Left | KeyCode::Up => {
+                app.select_prev();
+            }
+            _ => {}
+        }
+    }
+}
+
+fn render_bottom_bar<B: Backend>(f: &mut tui::Frame<B>, area: tui::layout::Rect, app: &App) {
+    use tui::widgets::{Block, Borders, Paragraph, Wrap};
+    use tui::text::{Line, Span, Text};
+
+    let bottom_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(if app.input_mode {
+            vec![Constraint::Length(1), Constraint::Length(1)]
+        } else {
+            vec![Constraint::Length(1)]
+        })
+        .split(area);
+
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, plot_data) in app.data.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" | "));
+        }
+        let style = if i == app.selected_target {
+            Style::default()
+                .fg(plot_data.style.fg.unwrap_or(Color::White))
+                .add_modifier(Modifier::REVERSED)
+        } else {
+            plot_data.style
+        };
+        spans.push(Span::styled(format!("[{}] {}", i + 1, plot_data.display), style));
+    }
+    spans.push(Span::raw("   [+] Add  [-] Remove  [Tab/Arrows] Select  [q] Quit"));
+
+    let targets_line = Line::from(spans);
+    let targets_para = Paragraph::new(Text::from(targets_line))
+        .block(Block::default().borders(Borders::TOP))
+        .wrap(Wrap { trim: true });
+    f.render_widget(targets_para, bottom_layout[0]);
+
+    if app.input_mode {
+        let input_span = Span::styled(
+            format!("New target: {}_", app.input_buffer),
+            Style::default().fg(Color::Yellow),
+        );
+        let input_line = Line::from(vec![
+            Span::raw("[Enter] Confirm  [Esc] Cancel  "),
+            input_span,
+        ]);
+        let input_para = Paragraph::new(Text::from(input_line))
+            .block(Block::default().borders(Borders::NONE));
+        f.render_widget(input_para, bottom_layout[1]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn create_test_app(num_targets: usize) -> App {
+        let mut data = Vec::new();
+        let mut colors = Vec::new();
+        for i in 0..num_targets {
+            let color = Color::Indexed((i as u8 % 6) + 2);
+            colors.push(color);
+            data.push(PlotData::new(
+                format!("target{}", i + 1),
+                30,
+                Style::default().fg(color),
+                false,
+            ));
+        }
+        App::new(data, 30, colors)
+    }
+
+    #[test]
+    fn test_app_initial_state() {
+        let app = create_test_app(3);
+        assert_eq!(app.data.len(), 3);
+        assert_eq!(app.selected_target, 0);
+        assert_eq!(app.input_mode, false);
+        assert_eq!(app.input_buffer, "");
+        assert_eq!(app.id_to_idx.len(), 3);
+        assert_eq!(app.next_host_id, 3);
+    }
+
+    #[test]
+    fn test_select_next_and_prev() {
+        let mut app = create_test_app(3);
+        assert_eq!(app.selected_target, 0);
+
+        app.select_next();
+        assert_eq!(app.selected_target, 1);
+
+        app.select_next();
+        assert_eq!(app.selected_target, 2);
+
+        app.select_next();
+        assert_eq!(app.selected_target, 0);
+
+        app.select_prev();
+        assert_eq!(app.selected_target, 2);
+
+        app.select_prev();
+        assert_eq!(app.selected_target, 1);
+    }
+
+    #[test]
+    fn test_add_target() {
+        let mut app = create_test_app(2);
+        assert_eq!(app.data.len(), 2);
+        assert_eq!(app.next_host_id, 2);
+
+        let host_id = app.add_target(
+            "new_target".to_string(),
+            30,
+            Style::default().fg(Color::Red),
+            false,
+        );
+
+        assert_eq!(app.data.len(), 3);
+        assert_eq!(app.data[2].display, "new_target");
+        assert_eq!(host_id, 2);
+        assert_eq!(app.next_host_id, 3);
+        assert!(app.id_to_idx.contains_key(&host_id));
+        assert_eq!(app.id_to_idx[&host_id], 2);
+    }
+
+    #[test]
+    fn test_remove_target_middle() {
+        let mut app = create_test_app(3);
+        assert_eq!(app.data.len(), 3);
+        assert_eq!(app.data[0].display, "target1");
+        assert_eq!(app.data[1].display, "target2");
+        assert_eq!(app.data[2].display, "target3");
+
+        app.remove_target(1);
+
+        assert_eq!(app.data.len(), 2);
+        assert_eq!(app.data[0].display, "target1");
+        assert_eq!(app.data[1].display, "target3");
+
+        assert!(!app.id_to_idx.contains_key(&1));
+        assert_eq!(app.id_to_idx[&0], 0);
+        assert_eq!(app.id_to_idx[&2], 1);
+    }
+
+    #[test]
+    fn test_remove_target_first() {
+        let mut app = create_test_app(3);
+        app.remove_target(0);
+
+        assert_eq!(app.data.len(), 2);
+        assert_eq!(app.data[0].display, "target2");
+        assert_eq!(app.data[1].display, "target3");
+
+        assert!(!app.id_to_idx.contains_key(&0));
+        assert_eq!(app.id_to_idx[&1], 0);
+        assert_eq!(app.id_to_idx[&2], 1);
+    }
+
+    #[test]
+    fn test_remove_target_last() {
+        let mut app = create_test_app(3);
+        app.selected_target = 2;
+        app.remove_target(2);
+
+        assert_eq!(app.data.len(), 2);
+        assert_eq!(app.selected_target, 1);
+        assert_eq!(app.data[0].display, "target1");
+        assert_eq!(app.data[1].display, "target2");
+    }
+
+    #[test]
+    fn test_cannot_remove_last_target() {
+        let mut app = create_test_app(1);
+        app.remove_target(0);
+
+        assert_eq!(app.data.len(), 1);
+    }
+
+    #[test]
+    fn test_update_with_id_mapping() {
+        let mut app = create_test_app(3);
+        app.remove_target(1);
+
+        app.update(0, Some(Duration::from_millis(100)));
+        app.update(2, Some(Duration::from_millis(200)));
+
+        assert_eq!(app.data.len(), 2);
+        assert!(!app.data[0].data.is_empty());
+        assert!(!app.data[1].data.is_empty());
+    }
+
+    #[test]
+    fn test_update_removed_target_ignored() {
+        let mut app = create_test_app(3);
+        app.remove_target(1);
+
+        app.update(1, Some(Duration::from_millis(100)));
+        assert_eq!(app.data.len(), 2);
+    }
+
+    #[test]
+    fn test_update_invalid_id_ignored() {
+        let mut app = create_test_app(2);
+        app.update(999, Some(Duration::from_millis(100)));
+        assert_eq!(app.data.len(), 2);
+    }
+
+    #[test]
+    fn test_next_color() {
+        let mut app = create_test_app(2);
+        let color1 = app.next_color();
+        let color2 = app.next_color();
+        assert_ne!(color1, color2);
+    }
+
+    #[test]
+    fn test_add_and_remove_sequence() {
+        let mut app = create_test_app(2);
+
+        let id3 = app.add_target("t3".to_string(), 30, Style::default(), false);
+        let id4 = app.add_target("t4".to_string(), 30, Style::default(), false);
+        assert_eq!(app.data.len(), 4);
+
+        app.remove_target(1);
+        assert_eq!(app.data.len(), 3);
+        assert_eq!(app.data[0].display, "target1");
+        assert_eq!(app.data[1].display, "t3");
+        assert_eq!(app.data[2].display, "t4");
+
+        assert_eq!(app.id_to_idx[&0], 0);
+        assert_eq!(app.id_to_idx[&id3], 1);
+        assert_eq!(app.id_to_idx[&id4], 2);
+        assert!(!app.id_to_idx.contains_key(&1));
+
+        app.update(id4, Some(Duration::from_millis(50)));
+        assert!(!app.data[2].data.is_empty());
+    }
 }
