@@ -120,6 +120,7 @@ struct App {
     colors: Vec<Color>,
     id_to_idx: HashMap<usize, usize>,
     next_host_id: usize,
+    error_message: Option<String>,
 }
 
 impl App {
@@ -139,7 +140,16 @@ impl App {
             colors: initial_colors,
             id_to_idx,
             next_host_id,
+            error_message: None,
         }
+    }
+
+    fn set_error(&mut self, msg: impl Into<String>) {
+        self.error_message = Some(msg.into());
+    }
+
+    fn clear_error(&mut self) {
+        self.error_message = None;
     }
 
     fn allocate_host_id(&mut self) -> usize {
@@ -384,18 +394,21 @@ fn start_cmd_thread(
     watch_interval: Option<f32>,
     cmd_tx: Sender<Event>,
     kill_event: Arc<AtomicBool>,
-) -> JoinHandle<Result<()>> {
-    let mut words = watch_cmd.split_ascii_whitespace();
-    let cmd = words
-        .next()
-        .expect("Must specify a command to watch")
-        .to_string();
+) -> Result<JoinHandle<Result<()>>> {
+    let trimmed = watch_cmd.trim();
+    if trimmed.is_empty() {
+        bail!("Command cannot be empty");
+    }
+    let mut words = trimmed.split_ascii_whitespace();
+    let cmd = match words.next() {
+        Some(c) => c.to_string(),
+        None => bail!("Command cannot be empty or whitespace-only"),
+    };
     let cmd_args = words.map(|w| w.to_string()).collect::<Vec<String>>();
 
     let interval = Duration::from_millis((watch_interval.unwrap_or(0.5) * 1000.0) as u64);
 
-    // Pump cmd watches into the queue
-    thread::spawn(move || -> Result<()> {
+    Ok(thread::spawn(move || -> Result<()> {
         while !kill_event.load(Ordering::Acquire) {
             let start = Instant::now();
             let mut child = Command::new(&cmd)
@@ -414,7 +427,7 @@ fn start_cmd_thread(
             sleep(interval);
         }
         Ok(())
-    })
+    }))
 }
 
 fn start_ping_thread(
@@ -551,7 +564,7 @@ fn main() -> Result<()> {
                 args.watch_interval,
                 key_tx.clone(),
                 std::sync::Arc::clone(&target_kill),
-            );
+            )?;
             target_manager.add(TargetThread {
                 kill: target_kill,
                 handle: Some(handle),
@@ -647,63 +660,97 @@ fn main() -> Result<()> {
                 );
             }
             Event::AddTarget(target_str) => {
-                let color = app.next_color();
-                let target_str_resolved = match region_map::try_host_from_cloud_region(&target_str) {
-                    None => target_str.clone(),
-                    Some(new_domain) => new_domain,
-                };
-                let display = match args.cmd {
-                    true => target_str_resolved.clone(),
-                    false => match get_host_ipaddr(&target_str_resolved, args.ipv4, args.ipv6) {
-                        Ok(ip) => format!("{} ({})", target_str_resolved, ip),
-                        Err(_) => target_str_resolved.clone(),
-                    },
-                };
-                let new_host_id = app.add_target(
-                    display,
-                    args.buffer,
-                    Style::default().fg(color),
-                    args.simple_graphics,
-                );
-
-                let target_kill = Arc::new(AtomicBool::new(false));
-                if args.cmd {
-                    let handle = start_cmd_thread(
-                        &target_str_resolved,
-                        new_host_id,
-                        args.watch_interval,
-                        key_tx.clone(),
-                        std::sync::Arc::clone(&target_kill),
-                    );
-                    target_manager.add(TargetThread {
-                        kill: target_kill,
-                        handle: Some(handle),
-                        host_or_cmd: target_str_resolved,
-                    });
+                app.clear_error();
+                if let Err(e) = validate_target_input(&target_str, args.cmd) {
+                    app.set_error(e);
                 } else {
-                    let interval =
-                        Duration::from_millis((args.watch_interval.unwrap_or(0.2) * 1000.0) as u64);
-                    let mut ping_opts = if args.ipv4 {
-                        PingOptions::new_ipv4(target_str_resolved.clone(), interval, interface.clone())
-                    } else if args.ipv6 {
-                        PingOptions::new_ipv6(target_str_resolved.clone(), interval, interface.clone())
-                    } else {
-                        PingOptions::new(target_str_resolved.clone(), interval, interface.clone())
+                    let target_str_resolved = match region_map::try_host_from_cloud_region(&target_str) {
+                        None => target_str.clone(),
+                        Some(new_domain) => new_domain,
                     };
-                    if let Some(ping_args) = &ping_args {
-                        ping_opts = ping_opts.with_raw_arguments(ping_args.clone());
+
+                    if args.cmd {
+                        if let Err(e) = validate_command(&target_str_resolved) {
+                            app.set_error(format!("Invalid command: {}", e));
+                            continue;
+                        }
+                    } else {
+                        if let Err(e) = validate_hostname(&target_str_resolved) {
+                            app.set_error(format!("Invalid hostname: {}", e));
+                            continue;
+                        }
                     }
-                    if let Ok(handle) = start_ping_thread(
-                        ping_opts,
-                        new_host_id,
-                        key_tx.clone(),
-                        std::sync::Arc::clone(&target_kill),
-                    ) {
-                        target_manager.add(TargetThread {
-                            kill: target_kill,
-                            handle: Some(handle),
-                            host_or_cmd: target_str_resolved,
-                        });
+
+                    let color = app.next_color();
+                    let display = match args.cmd {
+                        true => target_str_resolved.clone(),
+                        false => match get_host_ipaddr(&target_str_resolved, args.ipv4, args.ipv6) {
+                            Ok(ip) => format!("{} ({})", target_str_resolved, ip),
+                            Err(e) => {
+                                app.set_error(format!("DNS resolution failed: {}", e));
+                                continue;
+                            }
+                        },
+                    };
+                    let new_host_id = app.add_target(
+                        display,
+                        args.buffer,
+                        Style::default().fg(color),
+                        args.simple_graphics,
+                    );
+
+                    let target_kill = Arc::new(AtomicBool::new(false));
+                    if args.cmd {
+                        match start_cmd_thread(
+                            &target_str_resolved,
+                            new_host_id,
+                            args.watch_interval,
+                            key_tx.clone(),
+                            std::sync::Arc::clone(&target_kill),
+                        ) {
+                            Ok(handle) => {
+                                target_manager.add(TargetThread {
+                                    kill: target_kill,
+                                    handle: Some(handle),
+                                    host_or_cmd: target_str_resolved,
+                                });
+                            }
+                            Err(e) => {
+                                app.remove_target(app.data.len() - 1);
+                                app.set_error(format!("Failed to start command: {}", e));
+                            }
+                        }
+                    } else {
+                        let interval =
+                            Duration::from_millis((args.watch_interval.unwrap_or(0.2) * 1000.0) as u64);
+                        let mut ping_opts = if args.ipv4 {
+                            PingOptions::new_ipv4(target_str_resolved.clone(), interval, interface.clone())
+                        } else if args.ipv6 {
+                            PingOptions::new_ipv6(target_str_resolved.clone(), interval, interface.clone())
+                        } else {
+                            PingOptions::new(target_str_resolved.clone(), interval, interface.clone())
+                        };
+                        if let Some(ping_args) = &ping_args {
+                            ping_opts = ping_opts.with_raw_arguments(ping_args.clone());
+                        }
+                        match start_ping_thread(
+                            ping_opts,
+                            new_host_id,
+                            key_tx.clone(),
+                            std::sync::Arc::clone(&target_kill),
+                        ) {
+                            Ok(handle) => {
+                                target_manager.add(TargetThread {
+                                    kill: target_kill,
+                                    handle: Some(handle),
+                                    host_or_cmd: target_str_resolved,
+                                });
+                            }
+                            Err(e) => {
+                                app.remove_target(app.data.len() - 1);
+                                app.set_error(format!("Failed to start ping: {}", e));
+                            }
+                        }
                     }
                 }
             }
@@ -715,7 +762,16 @@ fn main() -> Result<()> {
             }
             Event::Render => {
                 terminal.draw(|f| {
-                    let bottom_height = if app.input_mode { 3 } else { 2 };
+                    let bottom_height = {
+                        let mut h = 2;
+                        if app.input_mode || app.error_message.is_some() {
+                            h += 1;
+                        }
+                        if app.input_mode && app.error_message.is_some() {
+                            h += 1;
+                        }
+                        h
+                    };
                     let chunks = Layout::default()
                         .flex(Flex::Legacy)
                         .direction(Direction::Vertical)
@@ -808,6 +864,71 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+fn validate_target_input(input: &str, is_cmd_mode: bool) -> Result<(), String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("Input cannot be empty".to_string());
+    }
+    if trimmed.len() > 255 {
+        return Err("Input too long (max 255 characters)".to_string());
+    }
+    if is_cmd_mode {
+        validate_command(trimmed)
+    } else {
+        validate_hostname(trimmed)
+    }
+}
+
+fn validate_hostname(hostname: &str) -> Result<(), String> {
+    let trimmed = hostname.trim();
+    if trimmed.is_empty() {
+        return Err("Hostname cannot be empty".to_string());
+    }
+    if trimmed.len() > 253 {
+        return Err("Hostname too long (max 253 characters)".to_string());
+    }
+    if trimmed.contains(char::is_whitespace) {
+        return Err("Hostname cannot contain whitespace".to_string());
+    }
+
+    if trimmed.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+
+    if trimmed.starts_with('-') || trimmed.ends_with('-') {
+        return Err("Hostname cannot start or end with a hyphen".to_string());
+    }
+    if trimmed.contains("..") {
+        return Err("Hostname contains invalid '..' sequence".to_string());
+    }
+    for label in trimmed.split('.') {
+        if label.is_empty() {
+            return Err("Hostname contains empty label".to_string());
+        }
+        if label.len() > 63 {
+            return Err("Hostname label too long (max 63 characters)".to_string());
+        }
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err("Hostname can only contain ASCII letters, digits, and hyphens".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn validate_command(cmd: &str) -> Result<(), String> {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() {
+        return Err("Command cannot be empty".to_string());
+    }
+    if trimmed.split_ascii_whitespace().next().is_none() {
+        return Err("Command cannot be whitespace-only".to_string());
+    }
+    if trimmed.len() > 1024 {
+        return Err("Command too long (max 1024 characters)".to_string());
+    }
+    Ok(())
+}
+
 fn handle_key_event(
     key: crossterm::event::KeyEvent,
     app: &mut App,
@@ -817,11 +938,9 @@ fn handle_key_event(
         match key.code {
             KeyCode::Enter => {
                 let input = app.input_buffer.trim().to_string();
-                if !input.is_empty() {
-                    let _ = key_tx.send(Event::AddTarget(input));
-                }
                 app.input_mode = false;
                 app.input_buffer.clear();
+                let _ = key_tx.send(Event::AddTarget(input));
             }
             KeyCode::Esc => {
                 app.input_mode = false;
@@ -844,10 +963,12 @@ fn handle_key_event(
                 let _ = key_tx.send(Event::Terminate);
             }
             KeyCode::Char('+') | KeyCode::Char('=') => {
+                app.clear_error();
                 app.input_mode = true;
                 app.input_buffer.clear();
             }
             KeyCode::Char('-') => {
+                app.clear_error();
                 if app.data.len() > 1 {
                     let _ = key_tx.send(Event::RemoveTarget(app.selected_target));
                 }
@@ -867,13 +988,17 @@ fn render_bottom_bar<B: Backend>(f: &mut tui::Frame<B>, area: tui::layout::Rect,
     use tui::widgets::{Block, Borders, Paragraph, Wrap};
     use tui::text::{Line, Span, Text};
 
+    let mut constraints = vec![Constraint::Length(1)];
+    if app.input_mode || app.error_message.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+    if app.input_mode && app.error_message.is_some() {
+        constraints.push(Constraint::Length(1));
+    }
+
     let bottom_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints(if app.input_mode {
-            vec![Constraint::Length(1), Constraint::Length(1)]
-        } else {
-            vec![Constraint::Length(1)]
-        })
+        .constraints(constraints)
         .split(area);
 
     let mut spans: Vec<Span> = Vec::new();
@@ -898,6 +1023,20 @@ fn render_bottom_bar<B: Backend>(f: &mut tui::Frame<B>, area: tui::layout::Rect,
         .wrap(Wrap { trim: true });
     f.render_widget(targets_para, bottom_layout[0]);
 
+    let mut current_idx = 1;
+
+    if let Some(ref error_msg) = app.error_message {
+        let error_span = Span::styled(
+            format!("Error: {}", error_msg),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        );
+        let error_line = Line::from(vec![error_span]);
+        let error_para = Paragraph::new(Text::from(error_line))
+            .block(Block::default().borders(Borders::NONE));
+        f.render_widget(error_para, bottom_layout[current_idx]);
+        current_idx += 1;
+    }
+
     if app.input_mode {
         let input_span = Span::styled(
             format!("New target: {}_", app.input_buffer),
@@ -909,7 +1048,7 @@ fn render_bottom_bar<B: Backend>(f: &mut tui::Frame<B>, area: tui::layout::Rect,
         ]);
         let input_para = Paragraph::new(Text::from(input_line))
             .block(Block::default().borders(Borders::NONE));
-        f.render_widget(input_para, bottom_layout[1]);
+        f.render_widget(input_para, bottom_layout[current_idx]);
     }
 }
 
@@ -1097,5 +1236,106 @@ mod tests {
 
         app.update(id4, Some(Duration::from_millis(50)));
         assert!(!app.data[2].data.is_empty());
+    }
+
+    #[test]
+    fn test_error_message_handling() {
+        let mut app = create_test_app(2);
+        assert!(app.error_message.is_none());
+
+        app.set_error("Test error");
+        assert_eq!(app.error_message.as_deref(), Some("Test error"));
+
+        app.clear_error();
+        assert!(app.error_message.is_none());
+    }
+
+    #[test]
+    fn test_validate_target_input_ping_mode() {
+        assert!(validate_target_input("google.com", false).is_ok());
+        assert!(validate_target_input("192.168.1.1", false).is_ok());
+        assert!(validate_target_input("sub.domain.com", false).is_ok());
+
+        assert!(validate_target_input("", false).is_err());
+        assert!(validate_target_input("   ", false).is_err());
+        assert!(validate_target_input("host name", false).is_err());
+        assert!(validate_target_input("-hostname.com", false).is_err());
+        assert!(validate_target_input("hostname-.com", false).is_err());
+        assert!(validate_target_input("host..name.com", false).is_err());
+        assert!(validate_target_input("host name.com", false).is_err());
+    }
+
+    #[test]
+    fn test_validate_target_input_cmd_mode() {
+        assert!(validate_target_input("ls", true).is_ok());
+        assert!(validate_target_input("ls -la", true).is_ok());
+        assert!(validate_target_input("echo test", true).is_ok());
+
+        assert!(validate_target_input("", true).is_err());
+        assert!(validate_target_input("   ", true).is_err());
+    }
+
+    #[test]
+    fn test_validate_hostname() {
+        assert!(validate_hostname("google.com").is_ok());
+        assert!(validate_hostname("localhost").is_ok());
+        assert!(validate_hostname("my-server.local").is_ok());
+        assert!(validate_hostname("192.168.1.1").is_ok());
+        assert!(validate_hostname("::1").is_ok());
+        assert!(validate_hostname("a".repeat(63).as_str()).is_ok());
+        assert!(validate_hostname("a-b-c.com").is_ok());
+
+        assert!(validate_hostname("").is_err());
+        assert!(validate_hostname("   ").is_err());
+        assert!(validate_hostname("-bad.com").is_err());
+        assert!(validate_hostname("bad-.com").is_err());
+        assert!(validate_hostname("bad..com").is_err());
+        assert!(validate_hostname("bad .com").is_err());
+        assert!(validate_hostname("bad.com.").is_err());
+        assert!(validate_hostname(".bad.com").is_err());
+        assert!(validate_hostname("a".repeat(64).as_str()).is_err());
+        assert!(validate_hostname("host!name.com").is_err());
+    }
+
+    #[test]
+    fn test_validate_command() {
+        assert!(validate_command("ls").is_ok());
+        assert!(validate_command("ls -la").is_ok());
+        assert!(validate_command("echo hello world").is_ok());
+        assert!(validate_command("/usr/bin/python script.py").is_ok());
+        assert!(validate_command("  ls  -la  ").is_ok());
+
+        assert!(validate_command("").is_err());
+        assert!(validate_command("   ").is_err());
+        assert!(validate_command("\t\n").is_err());
+    }
+
+    #[test]
+    fn test_start_cmd_thread_empty_input_no_panic() {
+        let (tx, _rx) = mpsc::channel();
+        let kill = Arc::new(AtomicBool::new(false));
+
+        let result = start_cmd_thread("", 0, None, tx.clone(), kill.clone());
+        assert!(result.is_err());
+
+        let result = start_cmd_thread("   ", 0, None, tx.clone(), kill.clone());
+        assert!(result.is_err());
+
+        let result = start_cmd_thread("\t\n", 0, None, tx.clone(), kill.clone());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_start_cmd_thread_valid_input() {
+        let (tx, _rx) = mpsc::channel();
+        let kill = Arc::new(AtomicBool::new(false));
+
+        let result = start_cmd_thread("echo test", 0, Some(0.5), tx.clone(), kill.clone());
+        assert!(result.is_ok());
+
+        kill.store(true, Ordering::Release);
+        if let Ok(handle) = result {
+            let _ = handle.join();
+        }
     }
 }
